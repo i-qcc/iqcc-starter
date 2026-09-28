@@ -1,0 +1,54 @@
+backend:
+  type: str
+  help: "Customer/backend identifier. Used as the QUAM project name, state path, and IQCC cloud backend name."
+  choices:
+    - gilboa
+    - arbel
+    - lucy
+    - qolab
+
+
+hardware:
+  type: str
+  help: "QPU hardware architecture."
+  choices:
+    - fixed
+    - tunable
+
+os:
+  type: str
+  help: "Developer OS, used to pick the correct .vscode/settings.json values."
+  choices:
+    - unix
+    - windows
+
+_exclude:
+  - "copier.yaml"
+  - "copier.yml"
+  - "CLAUDE.md"
+  - "iqcc_setup.py"
+  - ".github"
+  - "~*"
+  - "*.py[co]"
+  - "__pycache__"
+  - ".git"
+  - ".DS_Store"
+  - ".svn"
+  - "{% if hardware != 'fixed' %}calibrations/fixed{% endif %}"
+  - "{% if hardware != 'tunable' %}calibrations/tunable{% endif %}"
+  - "{% if hardware != 'fixed' %}calibration_utils/fixed{% endif %}"
+  - "{% if hardware != 'tunable' %}calibration_utils/tunable{% endif %}"
+
+_tasks:
+  - command:
+      - "{{ _copier_python }}"
+      - "-c"
+      - |
+        import shutil
+        from pathlib import Path
+        for root in ("calibrations", "calibration_utils"):
+            src = Path(root) / "{{ hardware }}"
+            if src.is_dir():
+                for item in src.iterdir():
+                    shutil.move(str(item), root)
+                src.rmdir()

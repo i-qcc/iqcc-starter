@@ -1,0 +1,67 @@
+[project]
+name = "iqcc_client_tools"
+version = "0.1.0"
+description = "calibration, research and integration tools for IQCC"
+readme = "README.md"
+authors = [
+    {name = "Ofir Milul", email = "ofir.milul@quantum-machines.co"}
+    
+]
+license = {text = "BSD-3-Clause"}
+keywords = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.12,<=3.13"
+dependencies = [
+    "quam==0.6.0",
+    "qualang-tools==0.22.0",
+    "qm-qua==1.4.1",
+    "ipykernel>=6.29.3,<7.0.0",
+    "more-itertools",
+    "qiskit<=3.0.0",
+    "iqcc-cloud-client[all]==0.20.0",
+    "quam-builder",
+    "qualibration-libs@git+https://github.com/qua-platform/qualibration-libs.git@v0.3.1",
+    "qualibrate==1.5.1",
+    "tomli>=2.0.1; python_version < '3.11'",
+    "xarray>=2024.7.0",
+    "plotly>=5.24.1",
+    "lmfit>=1.3.3",
+    "scipy>=1.13.1",
+    "qiskit-experiments>=0.9.0",
+    "tqdm>=4.67.1",
+]
+
+# uv settings: https://docs.astral.sh/uv/reference/settings/
+[tool.uv]
+# link-mode controls how packages are placed in the venv.
+# Options: "symlink" (default) | "hardlink" | "copy" | "clone"
+# "symlink" — links .venv site-packages back to uv's global cache; fast and
+#   space-efficient, but breaks on file-systems without symlink support.
+# "copy" — duplicates files into the venv; uses more disk but works reliably
+#   on Windows / WSL2 mounted drives and produces a self-contained .venv.
+link-mode = "copy"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["calibration_utils", "config"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"_build_assets/_iqcc_bootstrap.py"  = "_iqcc_bootstrap.py"
+"_build_assets/_iqcc_bootstrap.pth" = "_iqcc_bootstrap.pth"
+
+[tool.iqcc]
+project-name = "{{ backend }}"
+default-timeout = 300
+
+[tool.uv.sources]
+quam-builder = { git = "https://github.com/qua-platform/quam-builder.git", tag = "v0.5.0" }
