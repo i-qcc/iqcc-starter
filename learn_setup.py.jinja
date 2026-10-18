@@ -1,0 +1,58 @@
+"""
+learn_setup.py
+
+Configures this checkout inside the IQCC Learn JupyterLab environment, where
+the QM/QUAM/qualibrate stack is preinstalled and cannot be modified. Unlike
+'install.py' (workstation only), it does no 'uv sync', no env-var bootstrap
+and no IQCC token / state download -- it only creates the working folders and
+runs 'qualibrate config'.
+
+Invoke from anywhere, with the kernel's own Python:
+
+    python learn_setup.py
+
+Idempotent; safe to re-run.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+PROJECT_NAME = "{{ backend }}"
+
+
+def log(msg: str) -> None:
+    print(f"[iqcc-learn] {msg}")
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parent
+    quam_state_path = repo_root / "config" / "quam-state" / PROJECT_NAME
+
+    quam_state_path.mkdir(parents=True, exist_ok=True)
+    (repo_root / "config" / "qualibrate").mkdir(parents=True, exist_ok=True)
+    (repo_root / "data").mkdir(exist_ok=True)
+    (repo_root / "logs").mkdir(exist_ok=True)
+
+    log(f"Configuring qualibrate (project={PROJECT_NAME})...")
+    qualibrate_cmd = [
+        "qualibrate", "config",
+        "--project", PROJECT_NAME,
+        "--storage-location", str(repo_root / "data" / PROJECT_NAME),
+        "--quam-state-path", str(quam_state_path),
+        "--log-folder", str(repo_root / "logs"),
+        "--calibration-library-folder", str(repo_root / "calibrations"),
+        "--auto-accept",
+    ]
+    try:
+        subprocess.run(qualibrate_cmd, check=True)
+    except FileNotFoundError:
+        sys.exit("[iqcc-learn][ERROR] 'qualibrate' was not found on PATH.")
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"[iqcc-learn][ERROR] 'qualibrate config' failed with exit code {exc.returncode}.")
+
+    log(f"Done. Put state.json / wiring.json in {quam_state_path}")
+
+
+if __name__ == "__main__":
+    main()
