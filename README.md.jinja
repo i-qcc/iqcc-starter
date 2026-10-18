@@ -1,0 +1,137 @@
+# {{ backend }} calibration workspace
+
+This repo is the starting point for running **pulse-level experiments on quantum
+hardware** through the Quantum Machines (QM) software stack. It's a working Python
+project, not a tutorial: it already has a working set of calibration scripts, a
+structured model of your quantum setup, and the plumbing to pull your system's
+current state from the cloud and run against real (or simulated) hardware. The rest
+of this README walks through what's here, starting broad and getting more technical
+as it goes — skim what you need, and follow the links for anything you want to go
+deeper on.
+
+## Folder organization
+
+| Folder | What's in it |
+|---|---|
+| `calibrations/` | The calibration scripts you run, numbered to suggest run order (e.g. `00_hello_qua.py`, `02a_resonator_spectroscopy.py`, ...). Each one defines a `qualibrate` node: a self-contained, runnable step that builds a QUA program, runs it, and saves its results. |
+| `calibration_utils/` | Shared code imported by the scripts in `calibrations/` — one subpackage per calibration, each holding its parameter definitions and, where relevant, its data-analysis and plotting logic. `calibrations/*.py` is the entry point; `calibration_utils/` is the reusable logic behind it. |
+| `config/` | Everything that describes *this* project's setup: which QUAM class models your QPU (`quam_builder/`), `qualibrate`'s own configuration (`qualibrate/`), and the live state of your quantum system (`quam-state/`, holding `wiring.json`/`state.json`). |
+| `00_start_here.ipynb`, `01_workflow.ipynb` | Jupyter notebooks. `00_start_here` walks through the anatomy of a node, part by part, with links to the docs of each package. `01_workflow` pulls the latest state and wiring, runs several nodes in sequence and shows their results. |
+| `data/` | Where calibration runs write their output datasets. |
+| `logs/` | Where `qualibrate` writes run logs. |
+| `user_scripts/` | Small utility scripts you run directly, such as `download_state_and_wiring.py`, which pulls the latest system state from the cloud into `config/quam-state/`. |
+| `_build_assets/` | Internal build/runtime plumbing — sets up the environment variables described below. Not something you need to touch day-to-day. |
+
+`install.py` (see [Installing](#installing) below) is what wires `config/`, `data/`,
+and `logs/` together the first time you set the project up.
+
+## QM packages used in this repo
+
+Running an experiment here means going from a pulse-level program, up through a
+model of your physical system, up through an orchestration layer that runs and
+tracks calibrations, connected to a cloud service that keeps that model in sync with
+the real hardware. Each package below is one layer of that stack, roughly in that
+order.
+
+**[QUA](https://docs.quantum-machines.co/)** (package `qm-qua`) is the pulse-level
+language for programming quantum hardware — the actual sequences of pulses, waits,
+and measurements sent to the machine. It's imported directly (`from qm.qua import
+*`) in every script under `calibrations/`, where the pulse sequence for that
+calibration is written using it (e.g. `calibrations/00_hello_qua.py`).
+
+**[QUAM](https://qua-platform.github.io/quam/)** (package `quam`, the "Quantum
+Abstract Machine") is a structured, persistent model of your quantum setup —
+qubits, resonators, drive lines, couplers, and their calibrated parameters — that
+sits above QUA. Rather than hand-writing hardware configuration for every script,
+each calibration loads this model once (`Quam.load()`) and reads/writes to it as
+qubits get characterized.
+
+**[quam-builder](https://github.com/qua-platform/quam-builder)** builds the
+concrete QUAM class for your specific QPU architecture. `config/quam_builder/`
+resolves to the right one for this project, so the rest of the code just imports
+`Quam` without needing to know the underlying architecture details.
+
+**[qualibrate](https://qua-platform.github.io/qualibrate/)** is the calibration
+orchestration layer: it wraps a QUAM model plus a QUA program into a reusable,
+trackable `QualibrationNode` (what each script in `calibrations/` defines), and can
+chain nodes together into a `QualibrationGraph` for multi-step bring-up or retuning
+workflows. It also owns its own run history, storage layout, and CLI, configured via
+`config/qualibrate/`.
+
+**[qualibration-libs](https://github.com/qua-platform/qualibration-libs)** is a
+helper library used inside calibration nodes for the parts common to most
+calibrations — fetching and shaping result data, running simulations, common
+parameter definitions, fitting/analysis utilities. You'll see it imported throughout
+`calibrations/` and `calibration_utils/`.
+
+**iqcc-cloud-client** is the cloud connectivity layer. Its `IQCC_Cloud` client
+fetches the latest known state and wiring of your quantum system from the cloud
+(`user_scripts/download_state_and_wiring.py`) — this is what keeps the QUAM model in
+`config/quam-state/` in sync with the real hardware, and what `install.py` uses to
+populate it on first setup.
+
+## Technical repo details
+
+{% if environment == 'learn' -%}
+### Installing
+
+This checkout lives in the IQCC Learn JupyterLab environment, where the QM stack is
+preinstalled. Run once, with the kernel's Python:
+
+```
+python learn_setup.py
+```
+
+This creates the working folders, adds a small `iqcc_workspace.pth` to your Python's
+site-packages so `calibration_utils` is importable (delete it to undo), and configures
+`qualibrate` for this project, then downloads the latest `state.json` and `wiring.json`
+into `config/quam-state/{{ backend }}/` (the nodes load state from there). It's idempotent —
+safe to re-run any time, which refreshes the state from the cloud.
+
+{%- else -%}
+### Installing
+
+After checking out the project, run:
+
+```
+uv run install.py
+```
+
+This installs dependencies (`uv sync`), configures `qualibrate` for this project
+(storage location, log folder, calibration library folder), verifies the environment
+bootstrap described below is working, and downloads the latest QUAM state and wiring
+for your system into `config/quam-state/`. It's idempotent — safe to re-run any time.
+
+{%- endif %}
+
+### Pulling template updates
+
+This workspace was rendered from [i-qcc/iqcc-starter](https://github.com/i-qcc/iqcc-starter)
+with [Copier](https://copier.readthedocs.io/). To pick up changes made to the
+template since your checkout was rendered, run `copier update --trust` from this
+directory.
+
+{% if environment != 'learn' -%}
+### Environment variables
+
+This project's `.venv` automatically sets five environment variables on every
+interpreter startup (`uv run`, an activated venv, `.venv/bin/qualibrate`,
+`calibrations/*.py`, pytest, Jupyter kernels) via a `.pth` file installed into
+`site-packages` at `uv sync` time. There is no shell rc file involved, and the
+project's values always win over anything already set in your environment.
+
+| Variable | Value |
+|---|---|
+| `REPO_ROOT` | this checkout's root |
+| `PROJECT_NAME` | from `pyproject.toml`'s `[tool.iqcc] project-name` |
+| `QUAM_STATE_PATH` | `<REPO_ROOT>/config/quam-state/<PROJECT_NAME>` |
+| `QUALIBRATE_CONFIG_FILE` | `<REPO_ROOT>/config/qualibrate` (a directory) |
+| `IQCC_DEFAULT_TIMEOUT` | from `pyproject.toml`'s `[tool.iqcc] default-timeout` |
+
+Set `IQCC_BOOTSTRAP_QUIET=1` to silence the override warnings printed to
+stderr when an inherited value gets replaced.
+
+The bootstrap module lives at `_build_assets/_iqcc_bootstrap.py` and is
+copied into `site-packages` at install time. Editing it requires
+`uv sync --reinstall-package iqcc_client_tools` to take effect.
+{%- endif %}
