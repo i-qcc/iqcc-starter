@@ -1,0 +1,19 @@
+{% set alias = '_BaseQuam' if environment == 'learn' else 'Quam' -%}
+{% if hardware == 'fixed' -%}
+from quam_builder.architecture.superconducting.qpu import FixedFrequencyQuam as {{ alias }}
+{%- else -%}
+from quam_builder.architecture.superconducting.qpu import FluxTunableQuam as {{ alias }}
+{%- endif %}
+{% if environment == 'learn' %}
+from pathlib import Path
+
+# No QUAM_STATE_PATH env var here, so a bare Quam.load() would have nothing to
+# resolve. Default to the state folder inside this checkout instead.
+QUAM_STATE_PATH = Path(__file__).resolve().parents[1] / "quam-state" / "{{ backend }}"
+
+
+class Quam(_BaseQuam):
+    @classmethod
+    def load(cls, filepath=None, *args, **kwargs):
+        return super().load(QUAM_STATE_PATH if filepath is None else filepath, *args, **kwargs)
+{% endif %}
