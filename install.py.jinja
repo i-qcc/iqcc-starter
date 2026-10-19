@@ -1,0 +1,255 @@
+# /// script
+# requires-python = ">=3.12,<=3.13"
+# dependencies = []
+# ///
+"""
+install.py
+
+Installs and configures the IQCC client tools in the *current* directory.
+Assumes the current working directory is already an iqcc-starter checkout
+(see the README for how to render one via 'iqcc_setup.py'), and that
+'git' and 'uv' are already installed and on PATH -- this script only checks
+for git, since uv must already be present for 'uv run install.py' to have
+run this script at all. Runs 'uv sync' and configures qualibrate. The five
+IQCC environment variables (REPO_ROOT, PROJECT_NAME, QUAM_STATE_PATH,
+QUALIBRATE_CONFIG_FILE, IQCC_DEFAULT_TIMEOUT) are no longer persisted to a
+shell rc file -- they are set automatically inside this project's .venv on
+every interpreter startup via a .pth bootstrap (see
+_build_assets/_iqcc_bootstrap.py). This script verifies that bootstrap
+works as a post-install check, then downloads the latest QUAM state and
+wiring for this backend as the final step.
+
+Invoke as:
+
+    uv run install.py
+
+Idempotent; safe to re-run from inside an existing checkout.
+"""
+
+# Manual equivalent, if you ever need to run (or re-run) a step by hand
+# instead of via this script. Run from inside the checkout root, with
+# <PROJECT_NAME> replaced by [tool.iqcc] project-name in pyproject.toml.
+# Each line below is a single command -- no line continuations -- so they
+# work unmodified in bash/zsh, PowerShell, and cmd.exe alike:
+#
+#   uv sync
+#   uv run python -c "from pathlib import Path; [Path(p).mkdir(parents=True, exist_ok=True) for p in ('config/quam-state/<PROJECT_NAME>', 'config/qualibrate')]"
+#   uv run qualibrate config --project <PROJECT_NAME> --storage-location data/<PROJECT_NAME> --quam-state-path config/quam-state/<PROJECT_NAME> --log-folder logs --calibration-library-folder calibrations --auto-accept
+#   uv run python -c "import os; print(os.environ.get('REPO_ROOT', ''))"
+#   uv run iqcc-cloud setup --IQCC-API-token <TOKEN>
+#   uv run python user_scripts/download_state_and_wiring.py
+
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+EXPECTED_PYPROJECT_NAME = "iqcc_client_tools"
+PROJECT_NAME: str  # set in main() by reading pyproject.toml's [tool.iqcc] table
+
+CYAN = "\033[96m"
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def log(msg: str) -> None:
+    print(f"[iqcc-install] {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"[iqcc-install][ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def is_our_repo(repo_root: Path) -> bool:
+    pyproject = repo_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    with pyproject.open("rb") as f:
+        data = tomllib.load(f)
+    return data.get("project", {}).get("name") == EXPECTED_PYPROJECT_NAME
+
+
+def read_iqcc_table(repo_root: Path) -> dict:
+    with (repo_root / "pyproject.toml").open("rb") as f:
+        data = tomllib.load(f)
+    return data.get("tool", {}).get("iqcc", {})
+
+
+def check_git() -> None:
+    if shutil.which("git") is None:
+        err(
+            "git is required but was not found on PATH. Install it from "
+            "https://git-scm.com/downloads, then re-run this script."
+        )
+    log("Found git on PATH.")
+
+
+def uv_subprocess_env() -> dict[str, str]:
+    # 'uv run install.py' sets VIRTUAL_ENV to its own ephemeral script
+    # environment. Nested 'uv' calls should always target this repo's
+    # '.venv', not that ephemeral env, so drop VIRTUAL_ENV to avoid uv's
+    # "does not match the project environment path" mismatch warning.
+    env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
+def run_uv_sync(repo_root: Path) -> None:
+    log(f"Running 'uv sync' in {repo_root}...")
+    try:
+        subprocess.run(
+            ["uv", "sync"], cwd=repo_root, check=True, env=uv_subprocess_env()
+        )
+    except subprocess.CalledProcessError as exc:
+        err(f"'uv sync' failed with exit code {exc.returncode}.")
+
+
+def run_qualibrate_config(repo_root: Path, quam_state_path: Path) -> None:
+    log(f"Configuring qualibrate (project={PROJECT_NAME})...")
+    qualibrate_cmd = [
+        "uv", "run", "--project", str(repo_root),
+        "qualibrate", "config",
+        "--project", PROJECT_NAME,
+        "--storage-location", str(repo_root / "data" / PROJECT_NAME),
+        "--quam-state-path", str(quam_state_path),
+        "--log-folder", str(repo_root / "logs"),
+        "--calibration-library-folder", str(repo_root / "calibrations"),
+        "--auto-accept",
+    ]
+    try:
+        subprocess.run(qualibrate_cmd, check=True, env=uv_subprocess_env())
+    except subprocess.CalledProcessError as exc:
+        err(f"'qualibrate config' failed with exit code {exc.returncode}.")
+
+
+def run_download_state_and_wiring(repo_root: Path) -> None:
+    log("Downloading latest QUAM state and wiring...")
+    script_path = repo_root / "user_scripts" / "download_state_and_wiring.py"
+    download_cmd = [
+        "uv", "run", "--project", str(repo_root), "python", str(script_path),
+    ]
+    try:
+        subprocess.run(download_cmd, check=True, env=uv_subprocess_env())
+    except subprocess.CalledProcessError as exc:
+        err(f"Downloading state and wiring failed with exit code {exc.returncode}.")
+
+
+def looks_like_iqcc_token(token: str) -> bool:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        payload_b64 = parts[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and "qpu" in payload
+
+
+def prompt_for_iqcc_token() -> str:
+    print()
+    print(f"{CYAN}{BOLD}┌─────────────────────────────────────────────────┐{RESET}")
+    print(f"{CYAN}{BOLD}│  🔐  IQCC Cloud setup                           │{RESET}")
+    print(f"{CYAN}{BOLD}└─────────────────────────────────────────────────┘{RESET}")
+    print(f"{CYAN}Paste your IQCC CLOUD token{RESET}")
+    print(f"{YELLOW}Press Enter with nothing pasted to skip this step.{RESET}")
+    print()
+    token = input(f"{BOLD}IQCC CLOUD token:{RESET} ").strip()
+    print()
+    return token
+
+
+def run_iqcc_cloud_setup(repo_root: Path, token: str) -> None:
+    log("Registering IQCC API token via 'iqcc-cloud setup'...")
+    setup_cmd = [
+        "uv", "run", "--project", str(repo_root),
+        "iqcc-cloud", "setup", "--IQCC-API-token", token,
+    ]
+    try:
+        subprocess.run(setup_cmd, check=True, env=uv_subprocess_env())
+    except subprocess.CalledProcessError as exc:
+        err(f"'iqcc-cloud setup' failed with exit code {exc.returncode}.")
+
+
+def run_bootstrap_check(repo_root: Path) -> None:
+    log("Verifying the .venv bootstrap sets REPO_ROOT...")
+    check_cmd = [
+        "uv", "run", "--project", str(repo_root),
+        "python", "-c",
+        "import os; print(os.environ.get('REPO_ROOT', ''))",
+    ]
+    try:
+        result = subprocess.run(
+            check_cmd, check=True, env=uv_subprocess_env(),
+            capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        err(f"Bootstrap verification failed to run (exit {exc.returncode}).")
+    if not result.stdout.strip():
+        err(
+            "Bootstrap verification failed: REPO_ROOT was empty when read "
+            "back from inside 'uv run --project'. The .pth bootstrap in "
+            "_build_assets/_iqcc_bootstrap.py did not set it -- check "
+            "stderr above for [iqcc-bootstrap] warnings."
+        )
+    log(f"Bootstrap verified (REPO_ROOT={result.stdout.strip()}).")
+
+
+def main() -> None:
+    global PROJECT_NAME
+    repo_root = Path.cwd()
+
+    if not is_our_repo(repo_root):
+        err(
+            "Current directory does not look like a client-onboarding checkout "
+            "(no matching pyproject.toml). cd into your checkout and re-run "
+            "this script."
+        )
+
+    iqcc = read_iqcc_table(repo_root)
+    project_name = iqcc.get("project-name")
+    default_timeout = iqcc.get("default-timeout")
+    if not project_name:
+        err("pyproject.toml is missing [tool.iqcc] project-name.")
+    if default_timeout is None:
+        err("pyproject.toml is missing [tool.iqcc] default-timeout.")
+    PROJECT_NAME = project_name
+
+    check_git()
+    run_uv_sync(repo_root)
+
+    quam_state_path = repo_root / "config" / "quam-state" / PROJECT_NAME
+    qualibrate_config_file = repo_root / "config" / "qualibrate"
+
+    # The .venv bootstrap (_build_assets/_iqcc_bootstrap.py) only sets
+    # QUAM_STATE_PATH / QUALIBRATE_CONFIG_FILE when the target already
+    # exists on disk -- it never creates directories itself, since it runs
+    # on every interpreter startup, not just at install time. Create them
+    # here, once, before qualibrate is configured.
+    quam_state_path.mkdir(parents=True, exist_ok=True)
+    qualibrate_config_file.mkdir(parents=True, exist_ok=True)
+
+    run_qualibrate_config(repo_root, quam_state_path)
+    run_bootstrap_check(repo_root)
+
+    token = prompt_for_iqcc_token()
+    if not token:
+        log("No token provided -- skipping IQCC cloud setup and state/wiring download.")
+    elif not looks_like_iqcc_token(token):
+        log("That doesn't look like a valid IQCC API token -- skipping IQCC cloud setup and state/wiring download.")
+    else:
+        run_iqcc_cloud_setup(repo_root, token)
+        run_download_state_and_wiring(repo_root)
+
+    log(f"Done. REPO_ROOT={repo_root}")
+
+
+if __name__ == "__main__":
+    main()

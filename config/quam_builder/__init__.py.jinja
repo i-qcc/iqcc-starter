@@ -1,0 +1,5 @@
+{% if hardware == 'fixed' -%}
+from quam_builder.architecture.superconducting.qpu import FixedFrequencyQuam as Quam
+{%- else -%}
+from quam_builder.architecture.superconducting.qpu import FluxTunableQuam as Quam
+{%- endif %}
