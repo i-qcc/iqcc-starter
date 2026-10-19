@@ -1,0 +1,88 @@
+backend:
+  type: str
+  help: "Customer/backend identifier. Used as the QUAM project name, state path, and IQCC cloud backend name."
+  choices:
+    - gilboa
+    - arbel
+    - lucy
+    - qolab
+
+
+hardware:
+  type: str
+  help: "QPU hardware architecture."
+  choices:
+    - fixed
+    - tunable
+
+os:
+  type: str
+  help: "Developer OS, used to pick the correct .vscode/settings.json values."
+  choices:
+    - unix
+    - windows
+
+environment:
+  type: str
+  help: "Target environment. 'learn' = IQCC Learn JupyterLab (preinstalled stack, no install.py / env-var bootstrap)."
+  choices:
+    - workstation
+    - learn
+  default: workstation
+
+_exclude:
+  - "copier.yaml"
+  - "copier.yml"
+  - "CLAUDE.md"
+  - "iqcc_setup.py"
+  - "iqcc_learn_setup.py"
+  - ".github"
+  - "~*"
+  - "*.py[co]"
+  - "__pycache__"
+  - ".git"
+  - ".DS_Store"
+  - ".svn"
+  - "{% if hardware != 'fixed' %}calibrations/fixed{% endif %}"
+  - "{% if hardware != 'tunable' %}calibrations/tunable{% endif %}"
+  - "{% if hardware != 'fixed' %}calibration_utils/fixed{% endif %}"
+  - "{% if hardware != 'tunable' %}calibration_utils/tunable{% endif %}"
+  - "{% if environment == 'learn' %}install.py{% endif %}"
+  - "{% if environment == 'learn' %}_build_assets{% endif %}"
+  - "{% if environment == 'learn' %}user_scripts{% endif %}"
+  - "{% if environment == 'learn' %}.vscode{% endif %}"
+  - "{% if environment != 'learn' %}learn_setup.py{% endif %}"
+
+_tasks:
+  - command:
+      - "{{ _copier_python }}"
+      - "-c"
+      - |
+        import shutil
+        from pathlib import Path
+        for root in ("calibrations", "calibration_utils"):
+            src = Path(root) / "{{ hardware }}"
+            if src.is_dir():
+                for item in src.iterdir():
+                    shutil.move(str(item), root)
+                src.rmdir()
+  # learn only: the package isn't installed there, so `config` can't be imported.
+  # Point every node at quam_builder directly and load state from a path anchored on the node file
+  # (independent of the cwd).
+  - when: "{{ environment == 'learn' }}"
+    command:
+      - "{{ _copier_python }}"
+      - "-c"
+      - |
+        from pathlib import Path
+        old_import = "from config.quam_builder import Quam"
+        new_import = "from pathlib import Path\nfrom quam_builder.architecture.superconducting.qpu import {{ 'FixedFrequencyQuam' if hardware == 'fixed' else 'FluxTunableQuam' }} as Quam"
+        new_load = 'Quam.load(str(Path(__file__).resolve().parent.parent / "config" / "quam-state" / "{{ backend }}"))'
+        for path in Path("calibrations").glob("*.py"):
+            text = path.read_text()
+            if old_import not in text and "Quam.load" not in text:
+                continue  # node doesn't use Quam (e.g. graph scripts)
+            new = text.replace(old_import, new_import).replace("Quam.load()", new_load)
+            if "config.quam_builder" in new or new.count("Quam.load(") != new.count(new_load):
+                raise SystemExit(f"learn rewrite failed for {path}: expected '{old_import}' and 'Quam.load()'")
+            path.write_text(new)
