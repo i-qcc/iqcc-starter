@@ -1,0 +1,112 @@
+backend:
+  type: str
+  help: "Customer/backend identifier. Used as the QUAM project name, state path, and IQCC cloud backend name."
+  choices:
+    - gilboa
+    - arbel
+    - lucy
+    - qolab
+    - meiron
+
+
+hardware:
+  type: str
+  help: "QPU hardware architecture."
+  choices:
+    "Fixed-frequency transmons": fixed_freq
+    "Flux-tunable transmons, fixed couplers": tunable_transmon
+    "Flux-tunable transmons and tunable couplers": tunable_coupler
+
+os:
+  type: str
+  help: "Developer OS, used to pick the correct .vscode/settings.json values."
+  choices:
+    - unix
+    - windows
+
+environment:
+  type: str
+  help: "Target environment. 'learn' = IQCC Learn JupyterLab (preinstalled stack, no install.py / env-var bootstrap)."
+  choices:
+    - workstation
+    - learn
+  default: workstation
+
+_exclude:
+  - "copier.yaml"
+  - "copier.yml"
+  - "CLAUDE.md"
+  - "iqcc_setup.py"
+  - "iqcc_learn_setup.py"
+  - ".github"
+  - "qua_libs_map.toml"
+  - "qua_libs_map.lock.json"
+  - ".claude"
+  - ".cursor"
+  - "~*"
+  - "*.py[co]"
+  - "__pycache__"
+  - ".git"
+  - ".DS_Store"
+  - ".svn"
+  # tunable_coupler inherits tunable_transmon: it keeps both staging folders
+  - "{% if hardware != 'fixed_freq' %}calibrations/fixed_freq{% endif %}"
+  - "{% if hardware not in ['tunable_transmon', 'tunable_coupler'] %}calibrations/tunable_transmon{% endif %}"
+  - "{% if hardware != 'tunable_coupler' %}calibrations/tunable_coupler{% endif %}"
+  - "{% if hardware != 'fixed_freq' %}calibration_utils/fixed_freq{% endif %}"
+  - "{% if hardware not in ['tunable_transmon', 'tunable_coupler'] %}calibration_utils/tunable_transmon{% endif %}"
+  - "{% if hardware != 'tunable_coupler' %}calibration_utils/tunable_coupler{% endif %}"
+  - "{% if environment == 'learn' %}install.py{% endif %}"
+  - "{% if environment == 'learn' %}_build_assets{% endif %}"
+  - "{% if environment == 'learn' %}user_scripts{% endif %}"
+  - "{% if environment == 'learn' %}.vscode{% endif %}"
+  - "{% if environment != 'learn' %}learn_setup.py{% endif %}"
+
+_tasks:
+  - command:
+      - "{{ _copier_python }}"
+      - "-c"
+      - |
+        import shutil
+        from pathlib import Path
+        # Base layers first, tunable_coupler last (it extends tunable_transmon). Only the folders
+        # that survived _exclude exist. Items from different layers must not collide.
+        for root in ("calibrations", "calibration_utils"):
+            seen = set()
+            for layer in ("fixed_freq", "tunable_transmon", "tunable_coupler"):
+                src = Path(root) / layer
+                if not src.is_dir():
+                    continue
+                for item in src.iterdir():
+                    if item.name == ".gitkeep":
+                        continue
+                    if item.name in seen:
+                        raise SystemExit(f"hardware layers collide on {root}/{item.name}")
+                    seen.add(item.name)
+                    dst = Path(root) / item.name
+                    if dst.is_dir():
+                        shutil.rmtree(dst)
+                    elif dst.exists():
+                        dst.unlink()
+                    shutil.move(str(item), str(dst))
+                shutil.rmtree(src)
+  # learn only: the package isn't installed there, so `config` can't be imported.
+  # Point every node at quam_builder directly and load state from a path anchored on the node file
+  # (independent of the cwd).
+  - when: "{{ environment == 'learn' }}"
+    command:
+      - "{{ _copier_python }}"
+      - "-c"
+      - |
+        from pathlib import Path
+        old_import = "from config.quam_builder import Quam"
+        new_import = "from pathlib import Path\nfrom quam_builder.architecture.superconducting.qpu import {{ 'FixedFrequencyQuam' if hardware == 'fixed_freq' else 'FluxTunableQuam' }} as Quam"
+        new_load = 'Quam.load(str(Path(__file__).resolve().parent.parent / "config" / "quam-state" / "{{ backend }}"))'
+        for path in Path("calibrations").glob("*.py"):
+            text = path.read_text()
+            if old_import not in text and "Quam.load" not in text:
+                continue  # node doesn't use Quam (e.g. graph scripts)
+            new = text.replace(old_import, new_import).replace("Quam.load()", new_load)
+            if "config.quam_builder" in new or new.count("Quam.load(") != new.count(new_load):
+                raise SystemExit(f"learn rewrite failed for {path}: expected '{old_import}' and 'Quam.load()'")
+            path.write_text(new)
