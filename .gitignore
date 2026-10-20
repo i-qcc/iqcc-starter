@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+uv.lock
+
+# Local calibration output (regenerated on every run) — keep the folders, ignore their contents
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
