@@ -1,0 +1,6 @@
+{% if hardware == 'fixed_freq' -%}
+from quam_builder.architecture.superconducting.qpu import FixedFrequencyQuam as Quam
+{%- else -%}
+{#- tunable couplers live on the qubit pairs of FluxTunableQuam, so tunable_transmon and tunable_coupler share it -#}
+from quam_builder.architecture.superconducting.qpu import FluxTunableQuam as Quam
+{%- endif %}
