@@ -1,0 +1,51 @@
+{% if environment == 'learn' -%}
+{% if hardware == 'fixed_freq' -%}
+from quam_builder.architecture.superconducting.qpu import FixedFrequencyQuam as Quam
+{%- else -%}
+{#- tunable couplers live on the qubit pairs of FluxTunableQuam, so tunable_transmon and tunable_coupler share it -#}
+from quam_builder.architecture.superconducting.qpu import FluxTunableQuam as Quam
+{%- endif %}
+{%- else -%}
+"""The QUAM class for the active backend, imported by every node as ``Quam``.
+
+A checkout holds one qualibrate project per backend (see ``config/qualibrate``).
+The active project names the backend, and the backend's hardware picks the
+QUAM class. Switch backends with ``uv run python user_scripts/switch_backend.py <backend>``.
+"""
+
+from qualibrate_config.resolvers import get_qualibrate_config, get_qualibrate_config_path
+
+# Backend -> hardware. Keep identical to BACKEND_TO_HARDWARE in iqcc_setup.py and
+# iqcc_learn_setup.py. install.py also reads this table (by parsing this file).
+# fixed_freq = fixed-frequency transmons; tunable_transmon = flux-tunable transmons,
+# fixed couplers; tunable_coupler = flux-tunable transmons and tunable couplers.
+BACKEND_TO_HARDWARE = {'gilboa': 'tunable_transmon', 'arbel': 'tunable_transmon', 'qolab': 'tunable_transmon', 'lucy': 'fixed_freq', 'meiron': 'tunable_coupler'}
+
+
+def active_backend() -> str:
+    """Name of the active qualibrate project, which is the backend name."""
+    return get_qualibrate_config(get_qualibrate_config_path()).project
+
+
+def _hardware(backend: str) -> str:
+    try:
+        return BACKEND_TO_HARDWARE[backend]
+    except KeyError:
+        raise ImportError(
+            f"The active qualibrate project '{backend}' is not a known backend "
+            f"({', '.join(BACKEND_TO_HARDWARE)}). Switch to one with "
+            "'uv run python user_scripts/switch_backend.py <backend>'."
+        ) from None
+
+
+HARDWARE = _hardware(active_backend())
+
+if HARDWARE == "fixed_freq":
+    from quam_builder.architecture.superconducting.qpu import FixedFrequencyQuam as Quam
+else:
+    # tunable couplers live on the qubit pairs of FluxTunableQuam, so tunable_transmon
+    # and tunable_coupler share it
+    from quam_builder.architecture.superconducting.qpu import FluxTunableQuam as Quam
+
+__all__ = ["Quam", "BACKEND_TO_HARDWARE", "HARDWARE", "active_backend"]
+{%- endif %}

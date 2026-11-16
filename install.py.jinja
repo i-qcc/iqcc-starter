@@ -1,0 +1,621 @@
+# /// script
+# requires-python = ">=3.12,<=3.13"
+# dependencies = []
+# ///
+"""
+install.py
+
+Installs and configures the IQCC client tools in the *current* directory.
+Assumes the current working directory is already an iqcc-starter checkout
+(see the README for how to render one via 'iqcc_setup.py'), and that
+'git' and 'uv' are already installed and on PATH -- this script only checks
+for git, since uv must already be present for 'uv run install.py' to have
+run this script at all.
+
+A checkout holds one qualibrate project per backend (QPU). This script runs
+'uv sync', configures qualibrate (shared log folder and calibration library),
+and makes sure every chosen backend has its own project, with its QUAM state
+in config/quam-state/<backend> and its run data in data/<backend>. The active
+project decides which backend the nodes run on; switch with
+'uv run python user_scripts/switch_backend.py <backend>'. The IQCC
+environment variables (REPO_ROOT, QUALIBRATE_CONFIG_FILE,
+IQCC_DEFAULT_TIMEOUT) are set inside this project's .venv on every
+interpreter startup via a .pth bootstrap (see _build_assets/_iqcc_bootstrap.py);
+this script verifies that bootstrap works, then downloads the latest QUAM
+state and wiring for each backend as the final step.
+
+Invoke as:
+
+    uv run install.py                          # existing backends, or a prompt
+    uv run install.py --backend gilboa --backend lucy
+    uv run install.py --backend arbel          # adds a backend to an existing checkout
+
+Which backends: those given with '--backend' (repeatable); else the backends
+this checkout already has; else a prompt (several can be picked). The first
+backend becomes the active project unless one is already active. A checkout
+only has the calibration nodes for the hardware it was rendered with; a backend
+that needs other nodes is rejected with the 'iqcc_setup.py --update --backend'
+command that adds them.
+
+The IQCC API token for each backend is taken, in order, from: the
+IQCC_API_TOKEN_<BACKEND> environment variable (e.g. IQCC_API_TOKEN_GILBOA), or
+IQCC_API_TOKEN when only one backend is being set up (no prompt; an invalid
+token is then an error); a token already saved for that backend in
+~/.config/iqcc_cloud/config.toml (no prompt, nothing to re-register;
+state/wiring are re-downloaded); otherwise a prompt, unless stdin is not a
+terminal, in which case that backend is skipped with a loud warning (no
+state, so no node can run on it). Whatever the source, the token is then
+checked against IQCC cloud; if the cloud rejects it the install fails. Pass
+'--no-iqcc-setup' to skip the whole token / state-download step (used by
+'iqcc_setup.py --update', so an update never overwrites the local state).
+
+'--migrate-from <backend>' (passed by 'iqcc_setup.py --update') converts a
+checkout made when a checkout held a single backend: its qualibrate config
+becomes project <backend>, keeping the existing state, data and token.
+
+Idempotent; safe to re-run from inside an existing checkout.
+"""
+
+# Manual equivalent, if you ever need to run (or re-run) a step by hand
+# instead of via this script. Run from inside the checkout root, with
+# <BACKEND> replaced by a backend name (repeat the per-backend lines for each).
+# Each line below is a single command -- no line continuations -- so they
+# work unmodified in bash/zsh, PowerShell, and cmd.exe alike:
+#
+#   uv sync --reinstall-package iqcc_client_tools
+#   uv run python -c "from pathlib import Path; [Path(p).mkdir(parents=True, exist_ok=True) for p in ('config/quam-state/<BACKEND>', 'config/qualibrate')]"
+#   uv run qualibrate config --project <BACKEND> --storage-location data --quam-state-path config/quam-state --log-folder logs --calibration-library-folder calibrations --auto-accept
+#   uv run qualibrate project create <BACKEND> --storage-location data/<BACKEND> --quam-state-path config/quam-state/<BACKEND> -y
+#   uv run qualibrate project switch <BACKEND>
+#   uv run python -c "import os; print(os.environ.get('REPO_ROOT', ''))"
+#   uv run iqcc-cloud setup --IQCC-API-token <TOKEN>
+#   uv run python user_scripts/download_state_and_wiring.py <BACKEND>
+
+import argparse
+import ast
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+EXPECTED_PYPROJECT_NAME = "iqcc_client_tools"
+TOKEN_ENV_VAR = "IQCC_API_TOKEN"
+# Run inside the project's env. IQCC_Cloud's constructor and state.list() print
+# an error but do NOT raise on a rejected token; list() then returns None.
+CLOUD_CHECK_CODE = """\
+import sys
+from iqcc_cloud_client import IQCC_Cloud
+qc = IQCC_Cloud(quantum_computer_backend=sys.argv[1])
+result = qc.state.list("state", limit=1)
+sys.exit(3 if result is None else (0 if result else 4))
+"""
+# Run inside the project's env: REPO_ROOT must be set by the .pth bootstrap,
+# and QUAM_STATE_PATH must not be (it would override the active project).
+BOOTSTRAP_CHECK_CODE = """\
+import os
+print(os.environ.get('REPO_ROOT', ''))
+print(os.environ.get('QUAM_STATE_PATH', ''))
+"""
+IQCC_CLOUD_CONFIG_FILE = Path.home() / ".config" / "iqcc_cloud" / "config.toml"
+
+CYAN = "\033[96m"
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def log(msg: str) -> None:
+    print(f"[iqcc-install] {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"[iqcc-install][ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def is_our_repo(repo_root: Path) -> bool:
+    pyproject = repo_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    with pyproject.open("rb") as f:
+        data = tomllib.load(f)
+    return data.get("project", {}).get("name") == EXPECTED_PYPROJECT_NAME
+
+
+def read_iqcc_table(repo_root: Path) -> dict:
+    with (repo_root / "pyproject.toml").open("rb") as f:
+        data = tomllib.load(f)
+    return data.get("tool", {}).get("iqcc", {})
+
+
+def backend_table(repo_root: Path) -> dict[str, str]:
+    # The backend -> hardware table lives in config/quam_builder/__init__.py (it
+    # also picks the QUAM class). Parsed, not imported: this script runs without
+    # the project's dependencies.
+    source = repo_root / "config" / "quam_builder" / "__init__.py"
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "BACKEND_TO_HARDWARE" for t in node.targets
+        ):
+            return dict(ast.literal_eval(node.value))
+    err(f"BACKEND_TO_HARDWARE not found in {source}.")
+    return {}
+
+
+def installed_hardware_layers(repo_root: Path) -> set[str] | None:
+    # The node layers this checkout was rendered with (copier's `hardware_layers`
+    # answer); None when unknown, e.g. a checkout without that answer.
+    answers = repo_root / ".copier-answers.yml"
+    if not answers.is_file():
+        return None
+    match = re.search(r"^hardware_layers:\s*(\S+)", answers.read_text(), re.MULTILINE)
+    if not match:
+        return None
+    layers = set(match.group(1).strip("'\"").split(","))
+    if "tunable_coupler" in layers:
+        layers.add("tunable_transmon")  # the coupler layer extends tunable_transmon
+    return layers
+
+
+def check_backend_layers(repo_root: Path, backends: list[str], table: dict[str, str]) -> None:
+    # A backend's nodes are rendered by copier, which this script can't do (the
+    # template is not in the checkout), so a backend needing a layer the checkout
+    # lacks has to be added through iqcc_setup.py --update.
+    layers = installed_hardware_layers(repo_root)
+    if layers is None:
+        return
+    missing = [b for b in backends if table[b] not in layers]
+    if missing:
+        flags = " ".join(f"--backend {b}" for b in missing)
+        err(
+            f"This checkout does not have the calibration nodes for {', '.join(missing)} "
+            f"({', '.join(sorted({table[b] for b in missing}))}). Add the backend(s) with the "
+            "setup script, which also renders those nodes. From the folder that contains "
+            f"this checkout:\n\n    uv run https://raw.githubusercontent.com/i-qcc/iqcc-starter/cloud/iqcc_setup.py "
+            f"--update {repo_root.name} {flags}\n"
+        )
+
+
+def qualibrate_dir(repo_root: Path) -> Path:
+    return repo_root / "config" / "qualibrate"
+
+
+def project_config_file(repo_root: Path, backend: str) -> Path:
+    return qualibrate_dir(repo_root) / "projects" / backend / "config.toml"
+
+
+def project_is_configured(repo_root: Path, backend: str) -> bool:
+    # 'qualibrate config --project X' leaves an empty projects/X/config.toml
+    # (and so did single-backend checkouts, which kept the paths in the main
+    # config.toml); a real project has its own state path and storage.
+    cfg = project_config_file(repo_root, backend)
+    return cfg.is_file() and bool(cfg.read_text().strip())
+
+
+def existing_backends(repo_root: Path, known: list[str]) -> list[str]:
+    projects = qualibrate_dir(repo_root) / "projects"
+    if not projects.is_dir():
+        return []
+    return sorted(p.name for p in projects.iterdir() if p.is_dir() and p.name in known)
+
+
+def active_project(repo_root: Path) -> str | None:
+    cfg = qualibrate_dir(repo_root) / "config.toml"
+    if not cfg.is_file():
+        return None
+    try:
+        with cfg.open("rb") as f:
+            return tomllib.load(f).get("qualibrate", {}).get("project")
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def check_git() -> None:
+    if shutil.which("git") is None:
+        err(
+            "git is required but was not found on PATH. Install it from "
+            "https://git-scm.com/downloads, then re-run this script."
+        )
+    log("Found git on PATH.")
+
+
+def uv_subprocess_env() -> dict[str, str]:
+    # 'uv run install.py' sets VIRTUAL_ENV to its own ephemeral script
+    # environment. Nested 'uv' calls should always target this repo's
+    # '.venv', not that ephemeral env, so drop VIRTUAL_ENV to avoid uv's
+    # "does not match the project environment path" mismatch warning.
+    env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
+def run_uv_sync(repo_root: Path) -> None:
+    # Reinstalling the project package refreshes the .pth bootstrap copy in
+    # site-packages, so a template update to it always takes effect.
+    log(f"Running 'uv sync' in {repo_root}...")
+    try:
+        subprocess.run(
+            ["uv", "sync", "--reinstall-package", EXPECTED_PYPROJECT_NAME],
+            cwd=repo_root, check=True, env=uv_subprocess_env(),
+        )
+    except subprocess.CalledProcessError as exc:
+        err(f"'uv sync' failed with exit code {exc.returncode}.")
+
+
+def run_qualibrate(repo_root: Path, *args: str) -> None:
+    cmd = ["uv", "run", "--project", str(repo_root), "qualibrate", *args]
+    try:
+        subprocess.run(cmd, check=True, env=uv_subprocess_env())
+    except subprocess.CalledProcessError as exc:
+        err(f"'qualibrate {' '.join(args[:2])}' failed with exit code {exc.returncode}.")
+
+
+def run_qualibrate_config(repo_root: Path, active: str) -> None:
+    # Shared settings. Per-backend paths live in each project's config, which
+    # 'qualibrate project create' writes only where they differ from these, so
+    # the shared storage / state path are the parent folders, never a
+    # backend's own (a single-backend checkout had its backend's paths here).
+    log(f"Configuring qualibrate (active project={active})...")
+    run_qualibrate(
+        repo_root, "config",
+        "--project", active,
+        "--storage-location", str(repo_root / "data"),
+        "--quam-state-path", str(repo_root / "config" / "quam-state"),
+        "--log-folder", str(repo_root / "logs"),
+        "--calibration-library-folder", str(repo_root / "calibrations"),
+        "--auto-accept",
+    )
+
+
+def ensure_project(repo_root: Path, backend: str) -> None:
+    quam_state_path = repo_root / "config" / "quam-state" / backend
+    quam_state_path.mkdir(parents=True, exist_ok=True)
+    if project_is_configured(repo_root, backend):
+        log(f"qualibrate project '{backend}' already exists.")
+        return
+    cfg = project_config_file(repo_root, backend)
+    if cfg.is_file():
+        # Empty placeholder (see project_is_configured); 'project create'
+        # refuses to touch an existing project, so clear it first.
+        cfg.unlink()
+        if not any(cfg.parent.iterdir()):
+            cfg.parent.rmdir()
+    log(f"Creating qualibrate project '{backend}'...")
+    run_qualibrate(
+        repo_root, "project", "create", backend,
+        "--storage-location", str(repo_root / "data" / backend),
+        "--quam-state-path", str(quam_state_path),
+        "-y",
+    )
+    if not project_is_configured(repo_root, backend):
+        err(f"'qualibrate project create {backend}' did not write {project_config_file(repo_root, backend)}.")
+
+
+def switch_project(repo_root: Path, backend: str) -> None:
+    run_qualibrate(repo_root, "project", "switch", backend)
+
+
+def migrate_legacy_project(repo_root: Path, backend: str) -> None:
+    # A single-backend checkout kept its state path and storage in the main
+    # config/qualibrate/config.toml. ensure_project() gives the backend its own
+    # project pointing at the same folders, so state, data and token are kept.
+    if project_is_configured(repo_root, backend):
+        log(f"'{backend}' is already a qualibrate project; nothing to migrate.")
+        return
+    log(
+        f"Migrating the single-backend setup to qualibrate project '{backend}' "
+        f"(state config/quam-state/{backend} and data data/{backend} are kept)."
+    )
+
+
+def run_download_state_and_wiring(repo_root: Path, backend: str) -> None:
+    log(f"Downloading latest QUAM state and wiring for '{backend}'...")
+    script_path = repo_root / "user_scripts" / "download_state_and_wiring.py"
+    download_cmd = [
+        "uv", "run", "--project", str(repo_root), "python", str(script_path), backend,
+    ]
+    try:
+        subprocess.run(download_cmd, check=True, env=uv_subprocess_env())
+    except subprocess.CalledProcessError as exc:
+        err(f"Downloading state and wiring failed with exit code {exc.returncode}.")
+
+
+def looks_like_iqcc_token(token: str) -> bool:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        payload_b64 = parts[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and "qpu" in payload
+
+
+def prompt_for_iqcc_token(backend: str) -> str:
+    print()
+    print(f"{CYAN}{BOLD}┌─────────────────────────────────────────────────┐{RESET}")
+    print(f"{CYAN}{BOLD}│  🔐  IQCC Cloud setup                           │{RESET}")
+    print(f"{CYAN}{BOLD}└─────────────────────────────────────────────────┘{RESET}")
+    print(f"{CYAN}Paste your IQCC CLOUD token for backend '{backend}'{RESET}")
+    print(f"{YELLOW}Press Enter with nothing pasted to skip this step.{RESET}")
+    print()
+    try:
+        token = input(f"{BOLD}IQCC CLOUD token ({backend}):{RESET} ").strip()
+    except EOFError:
+        # No input available (e.g. stdin is the NUL device, which Windows
+        # reports as a terminal) -- same as pressing Enter: skip this step.
+        token = ""
+    print()
+    return token
+
+
+def prompt_backends(known: list[str]) -> list[str]:
+    while True:
+        print()
+        print(f"{CYAN}{BOLD}┌───────────────────────────────────────────────────┐{RESET}")
+        print(f"{CYAN}{BOLD}│  ⚙️  Select backends                                  │{RESET}")
+        print(f"{CYAN}{BOLD}└───────────────────────────────────────────────────┘{RESET}")
+        for i, choice in enumerate(known, 1):
+            print(f"  {i}) {choice}")
+        print(f"{YELLOW}Pick one or more, separated by spaces or commas (e.g. '1 4').{RESET}")
+        print()
+        try:
+            raw = input(f"{BOLD}Backends:{RESET} ")
+        except EOFError:
+            raw = ""
+        print()
+        picked: list[str] = []
+        bad: list[str] = []
+        for item in raw.replace(",", " ").split():
+            if item.isdigit() and 1 <= int(item) <= len(known):
+                item = known[int(item) - 1]
+            if item in known:
+                if item not in picked:
+                    picked.append(item)
+            else:
+                bad.append(item)
+        if picked and not bad:
+            return picked
+        print(f"{YELLOW}Invalid selection '{raw.strip()}', try again.{RESET}")
+
+
+def load_saved_iqcc_token(backend: str) -> str:
+    """Token saved for this backend by 'iqcc-cloud setup', or '' if none/unreadable."""
+    if not IQCC_CLOUD_CONFIG_FILE.is_file():
+        return ""
+    try:
+        with IQCC_CLOUD_CONFIG_FILE.open("rb") as f:
+            token = tomllib.load(f).get("tokens", {}).get(backend, "")
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    return token.strip() if isinstance(token, str) else ""
+
+
+def read_iqcc_token(backend: str, only_backend: bool) -> tuple[str, str]:
+    """Return (token, source); source is 'env', 'saved', 'prompt' or '' (no token)."""
+    env_vars = [f"{TOKEN_ENV_VAR}_{backend.upper()}"]
+    if only_backend:
+        env_vars.append(TOKEN_ENV_VAR)
+    for var in env_vars:
+        env_token = os.environ.get(var, "").strip()
+        if env_token:
+            log(f"Using IQCC API token for '{backend}' from {var}.")
+            return env_token, "env"
+    saved_token = load_saved_iqcc_token(backend)
+    if saved_token and looks_like_iqcc_token(saved_token):
+        log(f"Found an IQCC API token already saved for backend '{backend}' in {IQCC_CLOUD_CONFIG_FILE}; not prompting.")
+        return saved_token, "saved"
+    if not sys.stdin.isatty():
+        return "", ""
+    return prompt_for_iqcc_token(backend), "prompt"
+
+
+def run_iqcc_cloud_setup(repo_root: Path, token: str) -> None:
+    log("Registering IQCC API token via 'iqcc-cloud setup'...")
+    setup_cmd = [
+        "uv", "run", "--project", str(repo_root),
+        "iqcc-cloud", "setup", "--IQCC-API-token", token,
+    ]
+    try:
+        subprocess.run(setup_cmd, check=True, env=uv_subprocess_env())
+    except subprocess.CalledProcessError as exc:
+        err(f"'iqcc-cloud setup' failed with exit code {exc.returncode}.")
+
+
+def verify_iqcc_token_saved(token: str, backend: str) -> None:
+    if load_saved_iqcc_token(backend) != token:
+        err(
+            f"The IQCC API token was not saved for backend '{backend}' in "
+            f"{IQCC_CLOUD_CONFIG_FILE}. Check that the token is valid and grants "
+            f"access to '{backend}'."
+        )
+    log(f"IQCC API token saved for backend '{backend}'.")
+
+
+def verify_iqcc_cloud_access(repo_root: Path, backend: str) -> None:
+    log(f"Verifying the token against IQCC cloud (backend '{backend}')...")
+    check_cmd = [
+        "uv", "run", "--project", str(repo_root),
+        "python", "-c", CLOUD_CHECK_CODE, backend,
+    ]
+    result = subprocess.run(check_cmd, env=uv_subprocess_env())
+    if result.returncode == 0:
+        log("IQCC cloud accepted the token.")
+        return
+    reasons = {
+        3: "rejected the token (invalid, expired, or no access to this backend)",
+        4: "accepted the token but has no QUAM state for this backend",
+    }
+    reason = reasons.get(
+        result.returncode,
+        f"could not be reached or the check crashed (exit code {result.returncode})",
+    )
+    err(
+        f"IQCC cloud check FAILED for '{backend}': the cloud {reason}.\n"
+        f"The QUAM state and wiring for '{backend}' were NOT downloaded, so you "
+        "CANNOT run calibration nodes on it until this is fixed.\n"
+        f"Fix: get a valid token for backend '{backend}', run "
+        "'uv run iqcc-cloud setup --IQCC-API-token <token>', then re-run "
+        f"'uv run install.py --backend {backend}'."
+    )
+
+
+def run_bootstrap_check(repo_root: Path) -> None:
+    log("Verifying the .venv bootstrap sets REPO_ROOT...")
+    check_cmd = [
+        "uv", "run", "--project", str(repo_root),
+        "python", "-c", BOOTSTRAP_CHECK_CODE,
+    ]
+    try:
+        result = subprocess.run(
+            check_cmd, check=True, env=uv_subprocess_env(),
+            capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        err(f"Bootstrap verification failed to run (exit {exc.returncode}).")
+    lines = result.stdout.splitlines() + ["", ""]
+    repo_root_value, quam_state_path = lines[0].strip(), lines[1].strip()
+    if not repo_root_value:
+        err(
+            "Bootstrap verification failed: REPO_ROOT was empty when read "
+            "back from inside 'uv run --project'. The .pth bootstrap in "
+            "_build_assets/_iqcc_bootstrap.py did not set it -- check "
+            "stderr above for [iqcc-bootstrap] warnings."
+        )
+    if quam_state_path:
+        err(
+            f"Bootstrap verification failed: QUAM_STATE_PATH is still set ({quam_state_path}); "
+            "it would override the active qualibrate project. Run "
+            "'uv sync --reinstall-package iqcc_client_tools' and re-run this script."
+        )
+    log(f"Bootstrap verified (REPO_ROOT={repo_root_value}).")
+
+
+def setup_iqcc_cloud(repo_root: Path, backend: str, only_backend: bool) -> None:
+    token, source = read_iqcc_token(backend, only_backend)
+    if not token:
+        print(
+            f"{YELLOW}{BOLD}WARNING: no IQCC token provided for '{backend}' -- its QUAM state and "
+            f"wiring were NOT downloaded, so you cannot run calibration nodes on it yet.{RESET}\n"
+            f"{YELLOW}Re-run 'uv run install.py --backend {backend}' with a token to finish.{RESET}"
+        )
+        return
+    if not looks_like_iqcc_token(token):
+        err(
+            f"The IQCC API token for '{backend}' does not look valid (expected a JWT "
+            f"with a 'qpu' claim; source: {source}). The QUAM state and wiring were NOT "
+            "downloaded, so you CANNOT run calibration nodes. Re-run "
+            f"'uv run install.py --backend {backend}' with a valid token."
+        )
+    if source != "saved":  # a saved token is already registered
+        run_iqcc_cloud_setup(repo_root, token)
+        verify_iqcc_token_saved(token, backend)
+    verify_iqcc_cloud_access(repo_root, backend)
+    # The download script writes into the active project's state folder.
+    switch_project(repo_root, backend)
+    run_download_state_and_wiring(repo_root, backend)
+
+
+def parse_args(known: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Install and configure this checkout.")
+    parser.add_argument(
+        "--backend", action="append", choices=known, default=[],
+        help="Backend to set up (repeatable). Default: the backends this checkout "
+        "already has, else a prompt.",
+    )
+    parser.add_argument(
+        "--no-iqcc-setup", action="store_true",
+        help="Skip the IQCC token check and the state/wiring download.",
+    )
+    parser.add_argument(
+        "--migrate-from", choices=known, default=None,
+        help="Turn a single-backend checkout's qualibrate config into this backend's project.",
+    )
+    return parser.parse_args()
+
+
+def choose_backends(repo_root: Path, args: argparse.Namespace, known: list[str]) -> list[str]:
+    backends = list(dict.fromkeys(args.backend))
+    if args.migrate_from and args.migrate_from not in backends:
+        backends.insert(0, args.migrate_from)
+    if args.backend:
+        return backends
+    for b in existing_backends(repo_root, known):
+        if b not in backends:
+            backends.append(b)
+    if backends:
+        return backends
+    if not sys.stdin.isatty():
+        err(
+            "No backend to set up: this checkout has none yet and there is no "
+            "terminal to ask. Pass one or more '--backend <name>' "
+            f"({', '.join(known)})."
+        )
+    return prompt_backends(known)
+
+
+def main() -> None:
+    repo_root = Path.cwd()
+
+    if not is_our_repo(repo_root):
+        err(
+            "Current directory does not look like a client-onboarding checkout "
+            "(no matching pyproject.toml). cd into your checkout and re-run "
+            "this script."
+        )
+    table = backend_table(repo_root)
+    known = list(table)
+    args = parse_args(known)
+
+    if read_iqcc_table(repo_root).get("default-timeout") is None:
+        err("pyproject.toml is missing [tool.iqcc] default-timeout.")
+
+    # Read before anything changes the qualibrate config.
+    configured_before = [b for b in known if project_is_configured(repo_root, b)]
+    current = active_project(repo_root)
+    backends = choose_backends(repo_root, args, known)
+    if args.migrate_from:
+        active = args.migrate_from
+    elif current in configured_before:
+        active = current
+    else:
+        active = backends[0]
+    check_backend_layers(repo_root, backends, table)
+    log(f"Backends: {', '.join(backends)} (active: {active}).")
+
+    check_git()
+    run_uv_sync(repo_root)
+
+    # The .venv bootstrap (_build_assets/_iqcc_bootstrap.py) only sets
+    # QUALIBRATE_CONFIG_FILE when the folder already exists on disk -- it
+    # never creates directories itself, since it runs on every interpreter
+    # startup, not just at install time. Create it here, once.
+    qualibrate_dir(repo_root).mkdir(parents=True, exist_ok=True)
+
+    if args.migrate_from:
+        migrate_legacy_project(repo_root, args.migrate_from)
+    run_qualibrate_config(repo_root, active)
+    for backend in backends:
+        ensure_project(repo_root, backend)
+    switch_project(repo_root, active)
+    run_bootstrap_check(repo_root)
+
+    if args.no_iqcc_setup:
+        log("--no-iqcc-setup given -- skipping IQCC cloud setup and state/wiring download.")
+    else:
+        for backend in backends:
+            setup_iqcc_cloud(repo_root, backend, only_backend=len(backends) == 1)
+        switch_project(repo_root, active)
+
+    log(f"Done. Backends: {', '.join(backends)}; active project: {active}. REPO_ROOT={repo_root}")
+
+
+if __name__ == "__main__":
+    main()
